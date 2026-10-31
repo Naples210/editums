@@ -8,9 +8,18 @@
 //  • A trusted server using the secret key (x-espobase-auth: service) can send any template
 //    to any address, and must pass its own idempotencyKey.
 
-const FROM = Deno.env.get("EMAIL_FROM") ?? "Editums <noreply@mail.editums.com>";
-const REPLY_TO = Deno.env.get("EMAIL_REPLY_TO") ?? "hello@mail.editums.com";
-const APP_URL = Deno.env.get("APP_URL") ?? "https://editums.espohost.com";
+// Espobase only grants access to secrets that exist; reading any other name throws.
+const env = (name: string): string | undefined => {
+  try {
+    return Deno.env.get(name) || undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const FROM = env("EMAIL_FROM") ?? "Editums <noreply@mail.editums.com>";
+const REPLY_TO = env("EMAIL_REPLY_TO") ?? "hello@mail.editums.com";
+const APP_URL = env("APP_URL") ?? "https://editums.espohost.com";
 
 type Rendered = { subject: string; html: string; text: string; tag: string };
 
@@ -70,7 +79,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** POST to Resend with an idempotency key; retry network errors, 429 and 5xx (fits the 10 s limit). */
 async function sendViaResend(payload: Record<string, unknown>, idempotencyKey: string) {
-  const apiKey = Deno.env.get("RESEND_API_KEY");
+  const apiKey = env("RESEND_API_KEY");
   if (!apiKey) throw new Error("RESEND_API_KEY secret is not set");
 
   let last = "unknown error";
