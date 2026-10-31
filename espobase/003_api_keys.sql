@@ -15,6 +15,7 @@ create table if not exists public.api_keys (
 create index if not exists api_keys_user_idx on public.api_keys (user_id);
 
 alter table public.api_keys enable row level security;
+grant select, insert, update, delete on public.api_keys to espobase_project_em28cq3dw9_authenticated;
 
 drop policy if exists api_keys_read_own on public.api_keys;
 create policy api_keys_read_own on public.api_keys
