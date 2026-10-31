@@ -1,0 +1,10 @@
+{
+  "name": "editums-publisher",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Connects social accounts, publishes scheduled Editums posts and runs Editums AI (Maui, images, video).",
+  "main": "server.js",
+  "engines": { "node": ">=20" },
+  "scripts": { "start": "node server.js" },
+  "dependencies": { "@anthropic-ai/sdk": "^1.3.0" }
+}

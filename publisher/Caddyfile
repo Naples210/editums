@@ -1,0 +1,3 @@
+api.editums.com {
+  reverse_proxy publisher:8080
+}

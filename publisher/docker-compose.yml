@@ -1,0 +1,17 @@
+services:
+  publisher:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    expose: ["8080"]
+    volumes: ["./media:/data/media"]
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on: [publisher]
+volumes:
+  caddy_data:
