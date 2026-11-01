@@ -900,7 +900,8 @@ setInterval(async () => {
 
 // ---------- Facebook Pages (Facebook Login) ----------
 // Needs FACEBOOK_APP_ID and FACEBOOK_APP_SECRET. Redirect URI to register in the Meta app:
-//   <PUBLIC_URL>/v1/oauth/facebook/callback
+//   <APP_URL>/fb-callback.html  (a static page on the site that forwards to /v1/oauth/facebook/callback,
+//   so Meta only has to trust the main site domain)
 const FB = {
   appId: env('FACEBOOK_APP_ID', ''), secret: env('FACEBOOK_APP_SECRET', ''), configId: env('FACEBOOK_CONFIG_ID', ''),
   version: env('FACEBOOK_GRAPH_VERSION', 'v26.0'),
@@ -908,7 +909,7 @@ const FB = {
 FB.graph = env('FACEBOOK_GRAPH_URL', 'https://graph.facebook.com/' + FB.version).replace(/\/$/, '');
 FB.dialog = env('FACEBOOK_DIALOG_URL', 'https://www.facebook.com/' + FB.version + '/dialog/oauth');
 const FB_SCOPES = 'pages_show_list,pages_manage_posts,pages_read_engagement';
-const fbRedirect = () => CFG.publicUrl + '/v1/oauth/facebook/callback';
+const fbRedirect = () => env('FACEBOOK_REDIRECT_URL', CFG.appUrl + '/fb-callback.html');
 const fbProof = token => crypto.createHmac('sha256', FB.secret).update(token).digest('hex');
 function fbErr(r, what) {
   const e = r.json?.error || {};
