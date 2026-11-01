@@ -560,20 +560,58 @@ const PLAN_LIMITS = {
   team: { chat: 3000, image: 200, video: 15, clip: 40 },
   agency: { chat: 10000, image: 500, video: 50, clip: 100 },
 };
-async function checkAllowance(userId, kind) {
-  const [admin] = await db('admins?user_id=eq.' + q(userId) + '&select=user_id');
-  if (admin) return;
-  const [sub] = await db('subscriptions?user_id=eq.' + q(userId) + '&select=plan,status');
-  const plan = sub && ['trialing', 'active'].includes(sub.status) ? String(sub.plan).toLowerCase() : 'starter';
-  const limit = (PLAN_LIMITS[plan] || PLAN_LIMITS.starter)[kind];
-  const month = new Date(); month.setUTCDate(1); month.setUTCHours(0, 0, 0, 0);
-  const used = await db(`ai_usage?user_id=eq.${q(userId)}&kind=eq.${kind}&created_at=gte.${q(month.toISOString())}&select=id`);
-  if ((used?.length || 0) >= limit) {
-    const what = { chat: 'Maui messages', image: 'AI images', video: 'AI videos', clip: 'video clipping runs' }[kind];
-    throw httpError(402, limit ? `You’ve used all ${limit} ${what} on your plan this month. Upgrade for more.` : `${what[0].toUpperCase() + what.slice(1)} aren’t included on the ${plan[0].toUpperCase() + plan.slice(1)} plan. Upgrade to use them.`);
-  }
+// Trials get the plan's features but only a small taste of the costly ones (AI video, clipping).
+const TRIAL_CAPS = { video: 2, clip: 2 };
+const USAGE_NAMES = { chat: 'Maui messages', image: 'AI images', video: 'AI videos', clip: 'video clipping runs' };
+const planCache = new Map();
+async function planFor(userId) {
+  const hit = planCache.get(userId);
+  if (hit && Date.now() - hit.at < 30000) return hit.v;
+  const [[admin], [sub]] = await Promise.all([db('admins?user_id=eq.' + q(userId) + '&select=user_id'), db('subscriptions?user_id=eq.' + q(userId) + '&select=plan,status')]);
+  const paying = !!(sub && ['trialing', 'active'].includes(sub.status) && PLAN_LIMITS[String(sub.plan).toLowerCase()]);
+  const v = { admin: !!admin, plan: paying ? String(sub.plan).toLowerCase() : 'starter', status: paying ? sub.status : 'none', trial: paying && sub.status === 'trialing' };
+  planCache.set(userId, { v, at: Date.now() });
+  return v;
 }
-const recordUsage = (userId, kind) => db('ai_usage', { method: 'POST', prefer: 'return=minimal', body: { user_id: userId, kind } });
+function limitFor(p, kind) {
+  if (p.admin) return Infinity;
+  const base = (PLAN_LIMITS[p.plan] || PLAN_LIMITS.starter)[kind] ?? 0;
+  return p.trial && TRIAL_CAPS[kind] !== undefined ? Math.min(base, TRIAL_CAPS[kind]) : base;
+}
+const monthStart = () => { const m = new Date(); m.setUTCDate(1); m.setUTCHours(0, 0, 0, 0); return m.toISOString(); };
+async function usedThisMonth(userId, kind) { return (await db(`ai_usage?user_id=eq.${q(userId)}&kind=eq.${kind}&created_at=gte.${q(monthStart())}&select=id`))?.length || 0; }
+// Checks the allowance and records the use in one step, one request per user at a time, so parallel
+// requests can't slip past the limit. Returns a usage id to refund if the work then fails.
+const usageLocks = new Map();
+async function reserveUsage(userId, kind) {
+  const prev = usageLocks.get(userId) || Promise.resolve();
+  let release; const mine = new Promise(r => (release = r));
+  const chain = prev.then(() => mine);
+  usageLocks.set(userId, chain);
+  chain.then(() => { if (usageLocks.get(userId) === chain) usageLocks.delete(userId); });
+  await prev;
+  try {
+    const p = await planFor(userId);
+    if (p.admin) return null;
+    const limit = limitFor(p, kind), used = await usedThisMonth(userId, kind), what = USAGE_NAMES[kind];
+    if (used >= limit) {
+      const planName = p.plan[0].toUpperCase() + p.plan.slice(1);
+      if (p.trial && limit < (PLAN_LIMITS[p.plan] || {})[kind]) throw httpError(402, `Your free trial includes ${limit} ${what}. Your plan’s full ${PLAN_LIMITS[p.plan][kind]} a month unlock when the trial ends and your first payment goes through.`);
+      throw httpError(402, limit ? `You’ve used all ${limit} ${what} on your ${planName} plan this month. Upgrade for more.` : `${what[0].toUpperCase() + what.slice(1)} aren’t included on the ${planName} plan. Upgrade to use them.`);
+    }
+    const [row] = await db('ai_usage', { method: 'POST', prefer: 'return=representation', body: { user_id: userId, kind } });
+    return row?.id || null;
+  } finally { release(); }
+}
+async function refundUsage(usageId) {
+  if (!usageId) return;
+  await db('ai_usage?id=eq.' + q(usageId), { method: 'DELETE', prefer: 'return=minimal' }).catch(e => console.warn('refund', e.message));
+}
+async function usageSummary(userId) {
+  const p = await planFor(userId), out = {};
+  for (const kind of Object.keys(USAGE_NAMES)) { const limit = limitFor(p, kind); out[kind] = { used: await usedThisMonth(userId, kind), limit: Number.isFinite(limit) ? limit : null }; }
+  return { plan: p.admin ? 'owner' : p.plan, status: p.admin ? 'owner' : p.status, trial: p.trial, resets: new Date(new Date(monthStart()).setUTCMonth(new Date(monthStart()).getUTCMonth() + 1)).toISOString(), usage: out };
+}
 
 const MAUI_SYSTEM = `You are Maui, the friendly AI social media agent inside Editums. You help creators and small businesses plan, write and schedule social posts.
 
@@ -599,7 +637,7 @@ async function mauiChat(userId, body) {
     .map(m => ({ role: m.role, content: m.content.slice(0, 8000) }));
   if (!history.length || history.at(-1).role !== 'user') throw httpError(400, 'Say something to Maui first.');
   while (history[0].role !== 'user') history.shift();
-  await checkAllowance(userId, 'chat');
+  const usageId = await reserveUsage(userId, 'chat');
   const channels = (Array.isArray(body.channels) ? body.channels : []).map(String).slice(0, 30);
   const context = `Today is ${String(body.today || new Date().toISOString().slice(0, 10)).slice(0, 10)} (user's time zone: ${String(body.tz || 'unknown').slice(0, 60)}). Selected channels: ${channels.length ? channels.join(', ') : 'none'}.`;
   history[history.length - 1] = { role: 'user', content: context + '\n\n' + history.at(-1).content };
@@ -613,6 +651,7 @@ async function mauiChat(userId, body) {
       messages: history,
     });
   } catch (e) {
+    await refundUsage(usageId);
     if (e instanceof Anthropic.RateLimitError) throw httpError(429, 'Maui is busy right now. Try again in a minute.');
     if (e instanceof Anthropic.APIError) { console.warn('claude', e.status, e.message); throw httpError(502, 'Maui couldn’t answer just now. Try again.'); }
     throw e;
@@ -620,7 +659,6 @@ async function mauiChat(userId, body) {
   if (msg.stop_reason === 'refusal') return { reply: 'Sorry, I can’t help with that one. Try asking another way.', posts: [] };
   const text = msg.content.filter(b => b.type === 'text').map(b => b.text).join('');
   let out; try { out = JSON.parse(text); } catch { out = { reply: text || 'Sorry, something went wrong. Try again.', posts: [] }; }
-  await recordUsage(userId, 'chat');
   const posts = (Array.isArray(out.posts) ? out.posts : []).filter(p => p && typeof p.caption === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(p.day) && Number.isInteger(p.hour) && p.hour >= 0 && p.hour < 24).slice(0, 30);
   return { reply: String(out.reply || ''), posts };
 }
@@ -638,14 +676,14 @@ async function startGeneration(userId, kind, body) {
   if (!CFG.falKey) throw httpError(503, 'AI images and video aren’t switched on yet.');
   const prompt = String(body.prompt || '').trim().slice(0, 2000);
   if (prompt.length < 3) throw httpError(400, 'Describe what you want first.');
-  await checkAllowance(userId, kind);
+  const usageId = await reserveUsage(userId, kind);
   const style = String(body.style || '').slice(0, 60);
-  const sub = kind === 'image'
+  let sub; try { sub = kind === 'image'
     ? await falSubmit(CFG.falImageModel, { prompt: style ? `${prompt}. Style: ${style}.` : prompt, image_size: IMAGE_SIZES[body.format] || 'square_hd', num_images: 1, enable_safety_checker: true })
-    : await falSubmit(CFG.falVideoModel, { prompt, duration: String(body.duration) === '10' ? '10' : '5', aspect_ratio: VIDEO_RATIOS[body.format] || '9:16' });
-  await recordUsage(userId, kind);
+    : await falSubmit(CFG.falVideoModel, { prompt, duration: String(body.duration) === '10' ? '10' : '5', aspect_ratio: VIDEO_RATIOS[body.format] || '9:16' }); }
+  catch (e) { await refundUsage(usageId); throw e; }
   const id = crypto.randomUUID();
-  jobs.set(id, { id, userId, kind, statusUrl: sub.status_url, responseUrl: sub.response_url, status: 'running', created: Date.now() });
+  jobs.set(id, { id, userId, kind, usageId, statusUrl: sub.status_url, responseUrl: sub.response_url, status: 'running', created: Date.now() });
   return { job: id, status: 'running' };
 }
 async function checkJob(userId, id) {
@@ -660,7 +698,8 @@ async function checkJob(userId, id) {
   const res = await fetchJson(job.responseUrl, { headers: auth });
   const files = job.kind === 'image' ? (res.json?.images || []) : (res.json?.video ? [res.json.video] : []);
   if (!res.ok || st.json.error || !files.length) {
-    job.status = 'failed'; job.result = { status: 'failed', error: 'Generation failed. Try a different description.' };
+    job.status = 'failed'; job.result = { status: 'failed', error: 'Generation failed. Try a different description. It didn’t count against your plan.' };
+    await refundUsage(job.usageId);
     return job.result;
   }
   const media = [];
@@ -674,6 +713,7 @@ async function checkJob(userId, id) {
     media.push({ id: mid, type, url: `${CFG.publicUrl}/v1/media/${mid}`, width: f.width || null, height: f.height || null });
   }
   job.status = media.length ? 'done' : 'failed';
+  if (!media.length) await refundUsage(job.usageId);
   job.result = media.length ? { status: 'done', media } : { status: 'failed', error: 'Couldn’t download the result. Try again.' };
   return job.result;
 }
@@ -787,7 +827,6 @@ async function startClipping(userId, body) {
   const source = String(body.source || '');
   let meta; try { meta = JSON.parse(await fs.readFile(mediaFile(source, 'json'), 'utf8')); } catch {}
   if (!MEDIA_ID.test(source) || !meta || meta.user !== userId || !meta.source) throw httpError(404, 'Upload the video again.');
-  await checkAllowance(userId, 'clip');
   const opts = {
     count: Math.min(10, Math.max(1, Number(body.count) || 3)),
     format: CLIP_FORMATS[body.format] !== undefined ? body.format : 'vertical',
@@ -795,9 +834,9 @@ async function startClipping(userId, body) {
     captions: body.captions !== false,
     wish: String(body.prompt || '').trim().slice(0, 500),
   };
-  await recordUsage(userId, 'clip');
+  const usageId = await reserveUsage(userId, 'clip');
   const id = crypto.randomUUID();
-  const job = { id, userId, kind: 'clip', local: true, status: 'running', stage: 'Waiting in line', created: Date.now() };
+  const job = { id, userId, kind: 'clip', usageId, local: true, status: 'running', stage: 'Waiting in line', created: Date.now() };
   jobs.set(id, job);
   clipQueue = clipQueue.then(() => runClipping(job, source, opts)).catch(() => {});
   return { job: id, status: 'running' };
@@ -841,6 +880,7 @@ async function runClipping(job, source, o) {
   } catch (e) {
     console.warn('clip', job.id, e.message);
     job.status = 'failed'; job.result = { status: 'failed', error: e.friendly || e.status ? e.message : 'Clipping failed. Try another video.' };
+    await refundUsage(job.usageId);
   } finally {
     await dropMedia(source); await dropMedia(audioId);
     for (const f of tmp) await fs.rm(f, { force: true });
@@ -879,6 +919,8 @@ async function authApiKey(req) {
     db('api_keys?id=eq.' + q(hit.keyId), { method: 'PATCH', prefer: 'return=minimal', body: { last_used_at: new Date().toISOString() } }).catch(() => {});
   }
   rateLimit(hit.keyId);
+  const p = await planFor(hit.userId);
+  if (!p.admin && (p.plan === 'starter' || p.status === 'none')) throw httpError(403, 'API and MCP access is included on the Creator, Team and Agency plans (trials included). Upgrade at ' + CFG.appUrl + '/#pricing');
   return { id: hit.userId, keyId: hit.keyId };
 }
 const rate = new Map();
@@ -1210,6 +1252,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(302, { location: to }); return res.end();
     }
     if (route === 'POST /v1/channels/bluesky') { const u = await authUser(req); const row = await bskyConnect(u.id, await readJson(req)); return send(res, 201, { channel: row }, origin); }
+    if (route === 'GET /v1/usage') { const u = await authUser(req); return send(res, 200, await usageSummary(u.id), origin); }
     if (route === 'POST /v1/ai/chat') { const u = await authUser(req); return send(res, 200, await mauiChat(u.id, await readJson(req)), origin); }
     if (route === 'POST /v1/ai/image' || route === 'POST /v1/ai/video') { const u = await authUser(req); return send(res, 202, await startGeneration(u.id, url.pathname.endsWith('image') ? 'image' : 'video', await readJson(req)), origin); }
     const jobm = /^\/v1\/ai\/jobs\/([0-9a-f-]{36})$/i.exec(url.pathname);
