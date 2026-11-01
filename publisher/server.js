@@ -1133,8 +1133,9 @@ async function saveStripeState(st) { await fs.mkdir(CFG.mediaDir, { recursive: t
 function subRow(sub) {
   const item = sub.items?.data?.[0] || {}, price = item.price || sub.plan || {};
   const interval = price.recurring?.interval || price.interval;
-  const plan = String(sub.metadata?.plan || price.metadata?.plan || PLAN_BY_AMOUNT[interval]?.[price.unit_amount ?? price.amount] || '').toLowerCase() || null;
-  const cycle = sub.metadata?.cycle || (interval === 'year' ? 'yearly' : interval === 'month' ? 'monthly' : null);
+  // The current price decides the plan: subscription metadata keeps the original plan after a switch in the customer portal.
+  const plan = String(price.metadata?.plan || PLAN_BY_AMOUNT[interval]?.[price.unit_amount ?? price.amount] || sub.metadata?.plan || '').toLowerCase() || null;
+  const cycle = interval === 'year' ? 'yearly' : interval === 'month' ? 'monthly' : (sub.metadata?.cycle || null);
   const ts = s => s ? new Date(s * 1000).toISOString() : null;
   return { plan, billing_period: cycle, status: sub.status === 'incomplete_expired' ? 'canceled' : sub.status,
     trial_ends_at: ts(sub.trial_end), current_period_end: ts(item.current_period_end || sub.current_period_end), provider_customer_id: sub.customer };
