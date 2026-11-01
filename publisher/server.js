@@ -1108,6 +1108,83 @@ async function handleMcp(req, res) {
   res.end(JSON.stringify(Array.isArray(body) ? replies : replies[0]));
 }
 
+// ---------- Stripe billing webhook ----------
+// Stripe → POST /v1/stripe/webhook. Verifies the Stripe-Signature header with STRIPE_WEBHOOK_SECRET,
+// then keeps public.subscriptions in sync. Checkout links carry ?client_reference_id=<user id>.
+const STRIPE_SECRET = env('STRIPE_WEBHOOK_SECRET', '');
+const PLAN_BY_AMOUNT = { month: { 900: 'starter', 1900: 'creator', 3900: 'team', 8900: 'agency' }, year: { 8400: 'starter', 18000: 'creator', 37200: 'team', 85200: 'agency' } };
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+async function readRaw(req, max = 1024 * 1024) {
+  let size = 0; const chunks = [];
+  for await (const c of req) { size += c.length; if (size > max) throw httpError(413, 'Request too large.'); chunks.push(c); }
+  return Buffer.concat(chunks);
+}
+function verifyStripe(raw, header, secret, toleranceSec = 300) {
+  const parts = {}; for (const kv of String(header || '').split(',')) { const [k, v] = kv.split('='); if (k && v) (parts[k.trim()] ||= []).push(v.trim()); }
+  const t = Number(parts.t?.[0]);
+  if (!t || !parts.v1?.length) return false;
+  if (Math.abs(Date.now() / 1000 - t) > toleranceSec) return false;
+  const expected = crypto.createHmac('sha256', secret).update(`${t}.`).update(raw).digest();
+  return parts.v1.some(sig => { const b = Buffer.from(sig, 'hex'); return b.length === expected.length && crypto.timingSafeEqual(b, expected); });
+}
+const stripeStateFile = () => path.join(CFG.mediaDir, 'stripe-state.json');
+async function loadStripeState() { try { return JSON.parse(await fs.readFile(stripeStateFile(), 'utf8')); } catch { return { pending: {}, last: {} }; } }
+async function saveStripeState(st) { await fs.mkdir(CFG.mediaDir, { recursive: true }); await fs.writeFile(stripeStateFile() + '.tmp', JSON.stringify(st)); await fs.rename(stripeStateFile() + '.tmp', stripeStateFile()); }
+function subRow(sub) {
+  const item = sub.items?.data?.[0] || {}, price = item.price || sub.plan || {};
+  const interval = price.recurring?.interval || price.interval;
+  const plan = String(sub.metadata?.plan || price.metadata?.plan || PLAN_BY_AMOUNT[interval]?.[price.unit_amount ?? price.amount] || '').toLowerCase() || null;
+  const cycle = sub.metadata?.cycle || (interval === 'year' ? 'yearly' : interval === 'month' ? 'monthly' : null);
+  const ts = s => s ? new Date(s * 1000).toISOString() : null;
+  return { plan, billing_period: cycle, status: sub.status === 'incomplete_expired' ? 'canceled' : sub.status,
+    trial_ends_at: ts(sub.trial_end), current_period_end: ts(item.current_period_end || sub.current_period_end), provider_customer_id: sub.customer };
+}
+let stripeLock = Promise.resolve();
+async function handleStripe(req, res) {
+  if (!STRIPE_SECRET) throw httpError(503, 'Billing webhook is not configured.');
+  const raw = await readRaw(req);
+  if (!verifyStripe(raw, req.headers['stripe-signature'], STRIPE_SECRET)) throw httpError(400, 'Invalid signature.');
+  const event = JSON.parse(raw.toString('utf8'));
+  // One event at a time so out-of-order deliveries can't race each other.
+  const run = stripeLock.then(() => applyStripeEvent(event));
+  stripeLock = run.catch(() => {});
+  await run;
+  res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"received":true}');
+}
+async function applyStripeEvent(event) {
+  const st = await loadStripeState();
+  const obj = event.data?.object || {};
+  const now = new Date().toISOString();
+  if (event.type === 'checkout.session.completed' && obj.mode === 'subscription') {
+    let userId = UUID_RE.test(obj.client_reference_id || '') ? obj.client_reference_id : null;
+    if (userId && !(await db('profiles?user_id=eq.' + q(userId) + '&select=user_id'))?.length) userId = null;
+    if (!userId && obj.customer_details?.email) {
+      const [p] = await db('profiles?email=ilike.' + q(obj.customer_details.email.replace(/[%_]/g, '')) + '&select=user_id') || [];
+      userId = p?.user_id || null;
+    }
+    if (!userId) { console.warn('stripe: checkout without a matching Editums user', obj.id); return; }
+    const pending = st.pending[obj.customer]?.row || { plan: null, billing_period: null, status: 'incomplete' }; // filled in by the subscription event
+    await db('subscriptions', { method: 'POST', prefer: 'resolution=merge-duplicates,return=minimal', body: { user_id: userId, ...pending, provider_customer_id: obj.customer, updated_at: now } });
+    delete st.pending[obj.customer];
+    await saveStripeState(st);
+    await notify(userId, 'Your Editums trial has started', pending.plan ? `Plan: ${pending.plan[0].toUpperCase() + pending.plan.slice(1)}` : 'Welcome aboard!', '#app-billing');
+    console.log('stripe: linked', obj.customer, 'to', userId);
+    return;
+  }
+  if (/^customer\.subscription\.(created|updated|deleted|paused|resumed)$/.test(event.type)) {
+    const row = subRow(obj);
+    if (event.type === 'customer.subscription.deleted') row.status = 'canceled';
+    // Ignore events older than the last one applied for this customer.
+    if ((st.last[obj.customer] || 0) > event.created) return;
+    st.last[obj.customer] = event.created;
+    const updated = await db('subscriptions?provider_customer_id=eq.' + q(obj.customer), { method: 'PATCH', prefer: 'return=representation', body: { ...row, updated_at: now } });
+    if (!updated?.length) st.pending[obj.customer] = { row, at: Date.now() }; // checkout.session.completed hasn't linked the user yet
+    for (const [k, v] of Object.entries(st.pending)) if (Date.now() - v.at > 30 * 86400000) delete st.pending[k];
+    await saveStripeState(st);
+    console.log('stripe:', event.type, obj.customer, row.plan, row.status, updated?.length ? '' : '(pending)');
+  }
+}
+
 // ---------- HTTP ----------
 function send(res, status, body, origin) {
   const h = { 'content-type': 'application/json', 'cache-control': 'no-store' };
@@ -1123,8 +1200,9 @@ const server = http.createServer(async (req, res) => {
   try {
     const route = req.method + ' ' + url.pathname;
     if (url.pathname === '/mcp') return await handleMcp(req, res);
+    if (req.method === 'POST' && url.pathname === '/v1/stripe/webhook') return await handleStripe(req, res);
     if (url.pathname === '/public/v1' || url.pathname.startsWith('/public/v1/')) return await handlePublic(req, res, url);
-    if (route === 'GET /health') return send(res, 200, { ok: true, providers: Object.keys(PUBLISHERS), ai: { maui: !!claude, media: !!CFG.falKey, clips: !!(claude && CFG.falKey) }, api: { rest: '/public/v1', mcp: '/mcp' } }, origin);
+    if (route === 'GET /health') return send(res, 200, { ok: true, providers: Object.keys(PUBLISHERS), ai: { maui: !!claude, media: !!CFG.falKey, clips: !!(claude && CFG.falKey) }, api: { rest: '/public/v1', mcp: '/mcp' }, billing: !!STRIPE_SECRET }, origin);
     if (route === 'GET /v1/oauth/mastodon/callback') {
       let to = CFG.appUrl + '/?connected=mastodon#app-calendar';
       try { await mastoCallback(url.searchParams); } catch (e) { to = CFG.appUrl + '/?channel_error=' + q(e.message) + '#app-calendar'; }
