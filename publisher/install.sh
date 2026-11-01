@@ -52,6 +52,8 @@ ask_key() { # name, label, prefix
 ask_key ANTHROPIC_API_KEY "Anthropic (Claude)" "sk-ant-"
 ask_key FAL_KEY "fal.ai" ""
 ask_key STRIPE_WEBHOOK_SECRET "Stripe webhook signing secret" "whsec_"
+ask_key FACEBOOK_APP_ID "Facebook (Meta) app ID" ""
+ask_key FACEBOOK_APP_SECRET "Facebook (Meta) app secret" ""
 
 if [ "$MODE" = nginx ]; then
   cat > docker-compose.yml <<YML

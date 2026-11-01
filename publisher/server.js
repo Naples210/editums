@@ -898,6 +898,114 @@ setInterval(async () => {
   } catch {}
 }, 3600 * 1000);
 
+// ---------- Facebook Pages (Facebook Login) ----------
+// Needs FACEBOOK_APP_ID and FACEBOOK_APP_SECRET. Redirect URI to register in the Meta app:
+//   <PUBLIC_URL>/v1/oauth/facebook/callback
+const FB = {
+  appId: env('FACEBOOK_APP_ID', ''), secret: env('FACEBOOK_APP_SECRET', ''), configId: env('FACEBOOK_CONFIG_ID', ''),
+  version: env('FACEBOOK_GRAPH_VERSION', 'v26.0'),
+};
+FB.graph = env('FACEBOOK_GRAPH_URL', 'https://graph.facebook.com/' + FB.version).replace(/\/$/, '');
+FB.dialog = env('FACEBOOK_DIALOG_URL', 'https://www.facebook.com/' + FB.version + '/dialog/oauth');
+const FB_SCOPES = 'pages_show_list,pages_manage_posts,pages_read_engagement';
+const fbRedirect = () => CFG.publicUrl + '/v1/oauth/facebook/callback';
+const fbProof = token => crypto.createHmac('sha256', FB.secret).update(token).digest('hex');
+function fbErr(r, what) {
+  const e = r.json?.error || {};
+  if (e.code === 190 || e.code === 102) return new Error('Facebook sign-in expired or was removed. Reconnect the Page.');
+  if (e.code === 10 || e.code === 200) return new Error('Facebook didn’t allow this. Reconnect the Page and grant all requested permissions.');
+  return new Error(`Facebook${what ? ' ' + what : ''}: ${e.error_user_msg || e.message || r.status}`);
+}
+async function fbGet(path, token, params = {}) {
+  const u = new URL(FB.graph + path);
+  for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
+  if (token) { u.searchParams.set('access_token', token); u.searchParams.set('appsecret_proof', fbProof(token)); }
+  return fetchJson(u);
+}
+async function fbPost(path, token, body) {
+  if (body instanceof FormData) { body.append('access_token', token); body.append('appsecret_proof', fbProof(token)); return fetchJson(FB.graph + path, { method: 'POST', body }); }
+  return fetchJson(FB.graph + path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...body, access_token: token, appsecret_proof: fbProof(token) }) });
+}
+async function fbStart(userId) {
+  if (!FB.appId || !FB.secret) throw httpError(503, 'Facebook isn’t switched on yet.');
+  const state = crypto.randomBytes(24).toString('base64url');
+  await db('oauth_states', { method: 'POST', prefer: 'return=minimal', body: { state, user_id: userId, provider: 'facebook', data: {} } });
+  const u = new URL(FB.dialog);
+  u.search = new URLSearchParams({ client_id: FB.appId, redirect_uri: fbRedirect(), state, response_type: 'code', ...(FB.configId ? { config_id: FB.configId } : { scope: FB_SCOPES }) }).toString();
+  return { url: u.toString() };
+}
+async function fbCallback(params) {
+  const state = params.get('state'), code = params.get('code');
+  if (!state || !code) throw new Error(params.get('error_description') || params.get('error_message') || 'Facebook sign-in was cancelled.');
+  const [st] = await db('oauth_states?state=eq.' + q(state) + '&select=*');
+  if (!st || st.provider !== 'facebook') throw new Error('This sign-in link expired. Try connecting again.');
+  await db('oauth_states?state=eq.' + q(state), { method: 'DELETE', prefer: 'return=minimal' });
+  if (Date.now() - new Date(st.created_at).getTime() > 15 * 60 * 1000) throw new Error('This sign-in link expired. Try connecting again.');
+  const short = await fbGet('/oauth/access_token', null, { client_id: FB.appId, client_secret: FB.secret, redirect_uri: fbRedirect(), code });
+  if (!short.ok || !short.json?.access_token) throw new Error('Facebook didn’t accept the sign-in. Try again.');
+  // Long-lived user token → Page tokens that don't expire.
+  const long = await fbGet('/oauth/access_token', null, { grant_type: 'fb_exchange_token', client_id: FB.appId, client_secret: FB.secret, fb_exchange_token: short.json.access_token });
+  const userToken = long.json?.access_token || short.json.access_token;
+  const pages = await fbGet('/me/accounts', userToken, { fields: 'id,name,access_token,picture{url},tasks', limit: '100' });
+  if (!pages.ok) throw fbErr(pages, 'pages');
+  const usable = (pages.json?.data || []).filter(p => p.access_token && (!Array.isArray(p.tasks) || p.tasks.includes('CREATE_CONTENT')));
+  if (!usable.length) throw new Error('No Facebook Pages found. You need to manage a Page and select it when Facebook asks which Pages to share.');
+  for (const p of usable) {
+    const secret = { pageId: p.id, pageToken: p.access_token };
+    const fields = { provider: 'facebook', handle: p.name, display_name: p.name, avatar_url: p.picture?.data?.url || null, instance: 'facebook.com', external_id: String(p.id) };
+    const [existing] = await db(`channels?user_id=eq.${q(st.user_id)}&provider=eq.facebook&external_id=eq.${q(p.id)}&select=id`);
+    if (existing) {
+      await db('channels?id=eq.' + q(existing.id), { method: 'PATCH', prefer: 'return=minimal', body: { ...fields, status: 'active' } });
+      await db('channel_tokens?channel_id=eq.' + q(existing.id), { method: 'PATCH', prefer: 'return=minimal', body: { data: seal(secret), updated_at: new Date().toISOString() } });
+    } else await saveChannel(st.user_id, fields, secret);
+  }
+  return usable.length;
+}
+const fbPostId = url => { const m = /facebook\.com\/(\d+)\/posts\/(\d+)/.exec(url || ''); return m ? `${m[1]}_${m[2]}` : null; };
+async function fbPublish(channel, secret, post) {
+  const text = String(post.caption || '');
+  const files = (await loadPostMedia(post)).slice(0, 10);
+  const body = { message: text };
+  if (files.length) {
+    const ids = [];
+    for (const f of files) {
+      const form = new FormData();
+      form.append('source', new Blob([f.data], { type: f.type }), f.name || 'image');
+      form.append('published', 'false');
+      if (f.alt) form.append('alt_text_custom', f.alt);
+      const up = await fbPost(`/${secret.pageId}/photos`, secret.pageToken, form);
+      if (!up.ok || !up.json?.id) throw fbErr(up, 'image upload');
+      ids.push(up.json.id);
+    }
+    body.attached_media = ids.map(id => ({ media_fbid: id }));
+  }
+  const r = await fbPost(`/${secret.pageId}/feed`, secret.pageToken, body);
+  if (!r.ok || !r.json?.id) throw fbErr(r);
+  const [pageId, postId] = String(r.json.id).split('_');
+  return `https://www.facebook.com/${pageId}/posts/${postId || pageId}`;
+}
+PUBLISHERS.facebook = fbPublish;
+CAPTION_LIMIT.facebook = 63206;
+PLUG_DRIVERS.facebook = {
+  async stats(ch, secret, post) {
+    const id = fbPostId(post.external_url); if (!id) return null;
+    const r = await fbGet('/' + id, secret.pageToken, { fields: 'likes.summary(true).limit(0),comments.summary(true).limit(0),shares' });
+    if (!r.ok) return null;
+    return { likes: r.json.likes?.summary?.total_count || 0, replies: r.json.comments?.summary?.total_count || 0, reposts: r.json.shares?.count || 0, ref: { id } };
+  },
+  async comment(ch, secret, post, st, text) {
+    const r = await fbPost(`/${st.ref.id}/comments`, secret.pageToken, { message: text });
+    if (!r.ok) throw fbErr(r, 'comment');
+  },
+  async repost() { throw new Error('Facebook doesn’t allow apps to reshare posts. Use “Auto-comment” or a notification instead.'); },
+};
+async function fbFollowers(ch) {
+  const [tok] = await db('channel_tokens?channel_id=eq.' + q(ch.id) + '&select=data'); if (!tok) return null;
+  const s = unseal(tok.data);
+  const r = await fbGet('/' + s.pageId, s.pageToken, { fields: 'followers_count,fan_count' });
+  return r.ok ? (r.json.followers_count ?? r.json.fan_count ?? null) : null;
+}
+
 // ---------- Public API (API keys) and MCP server ----------
 // Keys look like ed_live_<40 hex>. Only their SHA-256 fingerprint is stored (api_keys.key_hash).
 const API_KEY_RE = /^ed_live_[0-9a-f]{40}$/;
@@ -1049,6 +1157,7 @@ const API = {
       const row = { id: ch.id, provider: ch.provider, handle: ch.handle, followers: null, posts: 0, likes: 0, reposts: 0, replies: 0 };
       try {
         if (ch.provider === 'bluesky') row.followers = (await fetchJson('https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor=' + q(ch.external_id || ch.handle))).json?.followersCount ?? null;
+        if (ch.provider === 'facebook') row.followers = await fbFollowers(ch);
         if (ch.provider === 'mastodon' && ch.external_id) row.followers = (await fetchJson(`https://${mastoHost(ch.instance)}/api/v1/accounts/${q(ch.external_id)}`)).json?.followers_count ?? null;
       } catch {}
       const drv = PLUG_DRIVERS[ch.provider]; const mine = posts.filter(p => p.channel_id === ch.id);
@@ -1245,12 +1354,19 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/mcp') return await handleMcp(req, res);
     if (req.method === 'POST' && url.pathname === '/v1/stripe/webhook') return await handleStripe(req, res);
     if (url.pathname === '/public/v1' || url.pathname.startsWith('/public/v1/')) return await handlePublic(req, res, url);
-    if (route === 'GET /health') return send(res, 200, { ok: true, providers: Object.keys(PUBLISHERS), ai: { maui: !!claude, media: !!CFG.falKey, clips: !!(claude && CFG.falKey) }, api: { rest: '/public/v1', mcp: '/mcp' }, billing: !!STRIPE_SECRET }, origin);
+    if (route === 'GET /health') return send(res, 200, { ok: true, providers: Object.keys(PUBLISHERS).filter(p => p !== 'facebook' || (FB.appId && FB.secret)), ai: { maui: !!claude, media: !!CFG.falKey, clips: !!(claude && CFG.falKey) }, api: { rest: '/public/v1', mcp: '/mcp' }, billing: !!STRIPE_SECRET }, origin);
     if (route === 'GET /v1/oauth/mastodon/callback') {
       let to = CFG.appUrl + '/?connected=mastodon#app-calendar';
       try { await mastoCallback(url.searchParams); } catch (e) { to = CFG.appUrl + '/?channel_error=' + q(e.message) + '#app-calendar'; }
       res.writeHead(302, { location: to }); return res.end();
     }
+    if (route === 'GET /v1/oauth/facebook/callback') {
+      let to = CFG.appUrl + '/?connected=facebook#app-calendar';
+      try { await fbCallback(url.searchParams); } catch (e) { to = CFG.appUrl + '/?channel_error=' + q(e.message) + '#app-calendar'; }
+      res.writeHead(302, { location: to }); return res.end();
+    }
+    if (route === 'POST /v1/channels/facebook/start') { const u = await authUser(req); return send(res, 200, await fbStart(u.id), origin); }
+    if (route === 'GET /v1/analytics') { const u = await authUser(req); return send(res, 200, await API.analytics(u, Object.fromEntries(url.searchParams)), origin); }
     if (route === 'POST /v1/channels/bluesky') { const u = await authUser(req); const row = await bskyConnect(u.id, await readJson(req)); return send(res, 201, { channel: row }, origin); }
     if (route === 'GET /v1/usage') { const u = await authUser(req); return send(res, 200, await usageSummary(u.id), origin); }
     if (route === 'POST /v1/ai/chat') { const u = await authUser(req); return send(res, 200, await mauiChat(u.id, await readJson(req)), origin); }
