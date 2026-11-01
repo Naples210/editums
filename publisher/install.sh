@@ -54,6 +54,7 @@ ask_key FAL_KEY "fal.ai" ""
 ask_key STRIPE_WEBHOOK_SECRET "Stripe webhook signing secret" "whsec_"
 ask_key FACEBOOK_APP_ID "Facebook (Meta) app ID" ""
 ask_key FACEBOOK_APP_SECRET "Facebook (Meta) app secret" ""
+ask_key FACEBOOK_CONFIG_ID "Facebook Login for Business configuration ID" ""
 
 if [ "$MODE" = nginx ]; then
   cat > docker-compose.yml <<YML
